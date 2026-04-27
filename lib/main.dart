@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
+import 'dart:io' show WebSocket;
+import 'package:web_socket_channel/io.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -9,21 +11,15 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:http/http.dart' as http;
 
 // ── CONFIG ────────────────────────────────────────────────────────────────────
-
-// Use your new public domain
 const String VPS_HOST = 'market.tonidaraban.com'; 
-
-// Cloudflare Service Token (Found in Zero Trust > Access > Service Tokens)
-const String CF_CLIENT_ID     = '39bb4b0324ca4db82c6ef160a9a48a9e';
+const String CF_CLIENT_ID     = '39bb4b0324ca4db82c6ef160a9a48a9e.access';
 const String CF_CLIENT_SECRET = '53f74039111740b5575080a57c57cd1a29315412fc994662aef92449c79b0e00';
 
-// Radar placeholder — Bucharest
 const double kRadarLat    = 44.481829;
 const double kRadarLon    = 26.141610;
-const double kRadarRadius = 50.0; // nautical miles
+const double kRadarRadius = 10.0;
 
 // ── COLOURS ───────────────────────────────────────────────────────────────────
-
 const Color kBg    = Color(0xFF000000);
 const Color kCard  = Color(0xFF1C1C1E);
 const Color kGreen = Color(0xFF30D158);
@@ -32,15 +28,11 @@ const Color kWhite = Color(0xFFFFFFFF);
 const Color kGrey1 = Color(0xFF8E8E93);
 const Color kGrey2 = Color(0xFF2C2C2E);
 
-// ── ENTRY POINT ───────────────────────────────────────────────────────────────
-
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
   runApp(const MarketApp());
 }
-
-// ── APP ROOT ──────────────────────────────────────────────────────────────────
 
 class MarketApp extends StatelessWidget {
   const MarketApp({super.key});
@@ -58,21 +50,16 @@ class MarketApp extends StatelessWidget {
   }
 }
 
-// ── MARKET DATA MODEL ─────────────────────────────────────────────────────────
+// ── DATA MODELS ───────────────────────────────────────────────────────────────
 
 class MarketTick {
-  final String  symbol;
-  final double  price;
-  final double? bid;
-  final double? ask;
-  final double? open;
-  final double? change;
-  final double? changePct;
-  final String  ts;
+  final String symbol;
+  final double price;
+  final double? bid, ask, open, change, changePct;
+  final String ts;
 
   const MarketTick({
-    required this.symbol,
-    required this.price,
+    required this.symbol, required this.price,
     this.bid, this.ask, this.open, this.change, this.changePct,
     required this.ts,
   });
@@ -91,12 +78,13 @@ class MarketTick {
   bool get isUp => (changePct ?? 0) >= 0;
 }
 
-// ── WEBSOCKET SERVICE ─────────────────────────────────────────────────────────
+// ── MARKET SERVICE ────────────────────────────────────────────────────────────
 
 class MarketService extends ChangeNotifier {
   WebSocketChannel? _channel;
   Timer?            _pingTimer;
   Timer?            _reconnectTimer;
+  Timer?            _cryptoFallbackTimer;
 
   MarketTick?  latestTick;
   List<double> priceHistory     = [];
@@ -107,106 +95,219 @@ class MarketService extends ChangeNotifier {
   String       statusMsg        = 'Connecting...';
 
   static const int maxHistory = 300;
-
-  MarketService() { connect(); }
-
-  // 1. Switched to wss:// and removed port (Cloudflare handles 443)
   String get wsUri => 'wss://$VPS_HOST/ws';
 
-void connect() {
+  MarketService() {
+    connect();
+  }
+
+  void connect() {
+    _pingTimer?.cancel();
+    _reconnectTimer?.cancel();
+    _cancelCryptoFallback();
+
     statusMsg = 'Connecting...';
     connected = false;
     notifyListeners();
+
+    _connectAsync();
+  }
+
+  Future<void> _connectAsync() async {
     try {
-      // Use custom headers to bypass Cloudflare Access Login
-      final headers = {
-        'CF-Access-Client-Id': CF_CLIENT_ID,
-        'CF-Access-Client-Secret': CF_CLIENT_SECRET,
-      };
+      // Use dart:io WebSocket to allow custom headers for Cloudflare Access
+      final socket = await WebSocket.connect(
+        'wss://$VPS_HOST/ws',
+        headers: {
+          'CF-Access-Client-Id':     CF_CLIENT_ID,
+          'CF-Access-Client-Secret': CF_CLIENT_SECRET,
+        },
+      ).timeout(const Duration(seconds: 10));
 
-      _channel = WebSocketChannel.connect(
-        Uri.parse(wsUri),
-        // Connect automatically sends these headers during the handshake
+      _channel = IOWebSocketChannel(socket);
+
+      _channel!.stream.listen(
+        _onMessage,
+        onError: _onError,
+        onDone:  _onDone,
       );
 
-      // UPDATE: In current Flutter WebSocket packages, headers are handled 
-      // via the connect parameters for IO.
-      _channel = WebSocketChannel.connect(
-        Uri.parse(wsUri),
-      );
-
-      _channel!.stream.listen(_onMessage, onError: _onError, onDone: _onDone);
-      
-      // Cloudflare has a 100s idle timeout. Keep it tight at 20s.
       _pingTimer = Timer.periodic(
         const Duration(seconds: 20), (_) => _send({'action': 'ping'}));
-    } catch (_) { _scheduleReconnect(); }
+
+    } catch (e) {
+      debugPrint('Connect error: $e');
+      _scheduleReconnect();
+    }
   }
 
   void _onMessage(dynamic raw) {
-    final msg = jsonDecode(raw as String) as Map<String, dynamic>;
+    try {
+      final msg = jsonDecode(raw as String) as Map<String, dynamic>;
 
-    // ── Symbol list sent on connect ───────────────────────────────────
-    if (msg['type'] == 'symbol_list') {
-      availableSymbols = List<String>.from(msg['symbols'] ?? []);
-      connected  = true;
-      statusMsg  = 'Connected';
-      notifyListeners();
-      subscribe(subscribedSymbol);
-      return;
-    }
-
-    if (msg['type'] == 'pong') return;
-
-    // ── History burst from SQLite — draws chart instantly ─────────────
-    if (msg['type'] == 'history') {
-      final pts = msg['points'] as List<dynamic>;
-      priceHistory = pts.map((p) => (p['price'] as num).toDouble()).toList();
-      marketClosed = msg['market_closed'] ?? false;
-      if (pts.isNotEmpty) {
-        latestTick = MarketTick.fromJson(Map<String, dynamic>.from(pts.last));
+      if (msg['type'] == 'symbol_list') {
+        final syms = msg['symbols'] ??
+            msg['available_symbols'] ??
+            (msg['data'] is Map<String, dynamic>
+                ? (msg['data'] as Map<String, dynamic>)['symbols']
+                : null);
+        availableSymbols = List<String>.from(syms ?? []);
+        connected = true;
+        statusMsg = 'Connected';
+        notifyListeners();
+        subscribe(subscribedSymbol);
+        return;
       }
-      notifyListeners();
-      return;
+
+      if (msg['type'] == 'pong') return;
+
+      if (msg['type'] == 'history') {
+        final pts = _historyPoints(msg);
+        priceHistory = pts.map(_pointToPrice).toList();
+        marketClosed = msg['market_closed'] ?? false;
+        if (pts.isNotEmpty) {
+          _cancelCryptoFallback();
+          final last = pts.last;
+          latestTick = last is Map<String, dynamic>
+              ? MarketTick.fromJson(Map<String, dynamic>.from(last))
+              : MarketTick(
+                  symbol: subscribedSymbol,
+                  price: _pointToPrice(last),
+                  ts: '',
+                );
+        }
+        notifyListeners();
+        return;
+      }
+
+      final tickMap = _unwrapTickMap(msg);
+      if (tickMap != null && tickMap.containsKey('price')) {
+        _cancelCryptoFallback();
+        final tick = MarketTick.fromJson(tickMap);
+        latestTick = tick;
+        priceHistory.add(tick.price);
+        if (priceHistory.length > maxHistory) priceHistory.removeAt(0);
+        notifyListeners();
+      }
+    } catch (e, st) {
+      debugPrint('Parsing Error: $e\n$st');
     }
+  }
 
-    // ── Live tick ─────────────────────────────────────────────────────
-    if (msg.containsKey('price')) {
-      final tick = MarketTick.fromJson(msg);
-      latestTick = tick;
-      priceHistory.add(tick.price);
-      if (priceHistory.length > maxHistory) priceHistory.removeAt(0);
-      notifyListeners();
+  /// Server may send `points`, or nest under `data` / `payload`.
+  static List<dynamic> _historyPoints(Map<String, dynamic> msg) {
+    final top = msg['points'];
+    if (top is List<dynamic>) return top;
+
+    for (final key in ['data', 'payload']) {
+      final v = msg[key];
+      if (v is List<dynamic>) return v;
+      if (v is Map) {
+        final m = Map<String, dynamic>.from(v);
+        final inner = m['points'] ?? m['candles'] ?? m['bars'] ?? m['series'];
+        if (inner is List<dynamic>) return inner;
+      }
     }
+    return const [];
   }
 
-  void _onError(dynamic e) {
-    statusMsg = 'Error';
-    connected = false;
-    notifyListeners();
-    _scheduleReconnect();
+  /// Bar may be `{price}`, OHLC `{c}` / `{close}`, or a raw number.
+  static double _pointToPrice(dynamic p) {
+    if (p is num) return p.toDouble();
+    if (p is! Map) return 0.0;
+    final m = Map<String, dynamic>.from(p);
+    final v = m['price'] ?? m['close'] ?? m['c'] ?? m['last'] ?? m['lp'];
+    if (v is num) return v.toDouble();
+    return 0.0;
   }
 
-  void _onDone() {
-    statusMsg = 'Disconnected';
-    connected = false;
-    notifyListeners();
-    _scheduleReconnect();
-  }
-
-  void _scheduleReconnect() {
-    _pingTimer?.cancel();
-    _reconnectTimer?.cancel();
-    _reconnectTimer = Timer(const Duration(seconds: 5), connect);
+  /// Some servers wrap ticks: `{ "type":"tick", "data": { "price": ... } }`.
+  static Map<String, dynamic>? _unwrapTickMap(Map<String, dynamic> msg) {
+    if (msg.containsKey('price')) return msg;
+    final inner = msg['data'] ?? msg['payload'] ?? msg['tick'];
+    if (inner is Map) {
+      final m = Map<String, dynamic>.from(inner);
+      if (m.containsKey('price')) return m;
+    }
+    return null;
   }
 
   void subscribe(String symbol) {
     subscribedSymbol = symbol;
-    latestTick       = null;
-    priceHistory     = [];
-    marketClosed     = false;
+    latestTick = null;
+    priceHistory = [];
+    marketClosed = false;
+    _cancelCryptoFallback();
     _send({'action': 'subscribe', 'symbol': symbol});
+    _startCryptoFallbackIfNeeded();
     notifyListeners();
+  }
+
+  /// VPS currently often leaves `prices` empty and sends no ticks after subscribe;
+  /// poll public spot prices for crypto so the UI works until the server broadcasts.
+  static String? _coinbaseProduct(String symbol) {
+    switch (symbol) {
+      case 'BTC/USD':
+        return 'BTC-USD';
+      case 'ETH/USD':
+        return 'ETH-USD';
+      default:
+        return null;
+    }
+  }
+
+  void _cancelCryptoFallback() {
+    _cryptoFallbackTimer?.cancel();
+    _cryptoFallbackTimer = null;
+  }
+
+  void _startCryptoFallbackIfNeeded() {
+    final product = _coinbaseProduct(subscribedSymbol);
+    if (product == null) return;
+
+    final sym = subscribedSymbol;
+    Future<void> pull() async {
+      if (sym != subscribedSymbol || _coinbaseProduct(subscribedSymbol) == null) return;
+      try {
+        final uri = Uri.parse(
+            'https://api.coinbase.com/v2/prices/$product/spot');
+        final res = await http.get(uri).timeout(const Duration(seconds: 8));
+        if (sym != subscribedSymbol) return;
+        if (res.statusCode != 200) return;
+        final j = jsonDecode(res.body) as Map<String, dynamic>;
+        final data = j['data'] as Map<String, dynamic>?;
+        final amt = data?['amount'];
+        if (amt is! String) return;
+        final price = double.tryParse(amt);
+        if (price == null || sym != subscribedSymbol) return;
+
+        latestTick = MarketTick(
+          symbol: sym,
+          price: price,
+          ts: DateTime.now().toUtc().toIso8601String(),
+        );
+        priceHistory.add(price);
+        if (priceHistory.length > maxHistory) priceHistory.removeAt(0);
+        notifyListeners();
+      } catch (e) {
+        debugPrint('Coinbase fallback: $e');
+      }
+    }
+
+    unawaited(pull());
+    _cryptoFallbackTimer =
+        Timer.periodic(const Duration(seconds: 10), (_) => unawaited(pull()));
+  }
+
+  void _onError(dynamic e) => _scheduleReconnect();
+  void _onDone() => _scheduleReconnect();
+
+  void _scheduleReconnect() {
+    connected = false;
+    statusMsg = 'Reconnecting...';
+    notifyListeners();
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(const Duration(seconds: 5), connect);
   }
 
   void _send(Map<String, dynamic> msg) {
@@ -217,6 +318,7 @@ void connect() {
   void dispose() {
     _pingTimer?.cancel();
     _reconnectTimer?.cancel();
+    _cancelCryptoFallback();
     _channel?.sink.close();
     super.dispose();
   }
@@ -233,8 +335,9 @@ class DashboardShell extends StatefulWidget {
 class _DashboardShellState extends State<DashboardShell> {
   late final MarketService  _service;
   late final PageController _pageController;
-  int _currentPage = 1;
-
+  late final FocusNode      _focusNode;
+  int _currentPage  = 1;
+  int _settingsCursor = 0;
   static const int _pageCount = 3;
 
   @override
@@ -242,13 +345,79 @@ class _DashboardShellState extends State<DashboardShell> {
     super.initState();
     _service        = MarketService();
     _pageController = PageController(initialPage: 1);
+    _focusNode      = FocusNode();
   }
 
   @override
   void dispose() {
     _service.dispose();
     _pageController.dispose();
+    _focusNode.dispose();
     super.dispose();
+  }
+
+  void _handleKey(KeyEvent event) {
+    if (event is! KeyDownEvent) return;
+    final key = event.logicalKey;
+    final symbols = _service.availableSymbols;
+
+    if (key == LogicalKeyboardKey.arrowLeft) {
+      if (_currentPage > 0) {
+        _pageController.animateToPage(
+          _currentPage - 1,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeInOut,
+        );
+      }
+      return;
+    }
+
+    if (key == LogicalKeyboardKey.arrowRight) {
+      if (_currentPage < _pageCount - 1) {
+        _pageController.animateToPage(
+          _currentPage + 1,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeInOut,
+        );
+      }
+      return;
+    }
+
+    if (key == LogicalKeyboardKey.arrowUp ||
+        key == LogicalKeyboardKey.arrowDown) {
+      if (symbols.isEmpty || _currentPage != 2) return;
+      setState(() {
+        if (key == LogicalKeyboardKey.arrowDown) {
+          _settingsCursor = (_settingsCursor + 1) % symbols.length;
+        } else {
+          _settingsCursor =
+              (_settingsCursor - 1 + symbols.length) % symbols.length;
+        }
+      });
+      return;
+    }
+
+    if (key == LogicalKeyboardKey.keyE) {
+      if (symbols.isEmpty) return;
+      setState(() {
+        _settingsCursor = (_settingsCursor + 1) % symbols.length;
+      });
+      if (_currentPage != 2) {
+        _pageController.animateToPage(2,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeInOut);
+      }
+      return;
+    }
+
+    if (key == LogicalKeyboardKey.enter) {
+      if (symbols.isEmpty) return;
+      _service.subscribe(symbols[_settingsCursor]);
+      _pageController.animateToPage(1,
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeInOut);
+      return;
+    }
   }
 
   @override
@@ -256,55 +425,55 @@ class _DashboardShellState extends State<DashboardShell> {
     return AnimatedBuilder(
       animation: _service,
       builder: (context, _) {
-        return Scaffold(
-          backgroundColor: kBg,
-          body: Stack(
-            children: [
-
-              // ── Pages ───────────────────────────────────────────────
-              PageView(
-                controller:     _pageController,
-                onPageChanged:  (i) => setState(() => _currentPage = i),
-                scrollBehavior: const MaterialScrollBehavior().copyWith(
-                  dragDevices: {PointerDeviceKind.touch, PointerDeviceKind.mouse},
+        return KeyboardListener(
+          focusNode: _focusNode,
+          autofocus: true,
+          onKeyEvent: _handleKey,
+          child: Scaffold(
+            backgroundColor: kBg,
+            body: Stack(
+              children: [
+                PageView(
+                  controller:     _pageController,
+                  onPageChanged:  (i) => setState(() => _currentPage = i),
+                  scrollBehavior: const MaterialScrollBehavior().copyWith(
+                    dragDevices: {PointerDeviceKind.touch, PointerDeviceKind.mouse},
+                  ),
+                  children: [
+                    const RepaintBoundary(child: RadarPage()),
+                    StockPage(service: _service),
+                    SettingsPage(service: _service, cursor: _settingsCursor),
+                  ],
                 ),
-                children: [
-                  const RadarPage(),
-                  StockPage(service: _service),
-                  SettingsPage(service: _service),
-                ],
-              ),
-
-              // ── Page dots ────────────────────────────────────────────
-              Positioned(
-                bottom: 14, left: 0, right: 0,
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: List.generate(_pageCount, (i) {
-                    final active = i == _currentPage;
-                    return AnimatedContainer(
-                      duration: const Duration(milliseconds: 200),
-                      margin:   const EdgeInsets.symmetric(horizontal: 4),
-                      width:    active ? 20 : 7,
-                      height:   7,
-                      decoration: BoxDecoration(
-                        color:        active ? kWhite : kGrey2,
-                        borderRadius: BorderRadius.circular(4),
-                      ),
-                    );
-                  }),
+                Positioned(
+                  bottom: 14, left: 0, right: 0,
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: List.generate(_pageCount, (i) {
+                      final active = i == _currentPage;
+                      return AnimatedContainer(
+                        duration: const Duration(milliseconds: 200),
+                        margin:   const EdgeInsets.symmetric(horizontal: 4),
+                        width:    active ? 20 : 7,
+                        height:   7,
+                        decoration: BoxDecoration(
+                          color:        active ? kWhite : kGrey2,
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                      );
+                    }),
+                  ),
                 ),
-              ),
-
-              // ── Connection chip ──────────────────────────────────────
-              Positioned(
-                top: 14, right: 14,
-                child: _StatusChip(
-                  connected: _service.connected,
-                  label:     _service.statusMsg,
-                ),
-              ),
-            ],
+                if (!_service.connected)
+                  Positioned(
+                    top: 14, right: 14,
+                    child: _StatusChip(
+                      connected: _service.connected,
+                      label:     _service.statusMsg,
+                    ),
+                  ),
+              ],
+            ),
           ),
         );
       },
@@ -363,8 +532,6 @@ class StockPage extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-
-          // Symbol
           Text(service.subscribedSymbol,
             style: const TextStyle(
               color: kWhite, fontSize: 34,
@@ -372,10 +539,7 @@ class StockPage extends StatelessWidget {
           const SizedBox(height: 4),
           Text(_exchangeLabel(service.subscribedSymbol),
             style: const TextStyle(color: kGrey1, fontSize: 14)),
-
           const SizedBox(height: 28),
-
-          // Price
           tick == null
             ? const Text('—', style: TextStyle(color: kGrey1, fontSize: 50))
             : Text(
@@ -384,10 +548,7 @@ class StockPage extends StatelessWidget {
                   color: kWhite, fontSize: 50, fontWeight: FontWeight.w300,
                   fontFeatures: [FontFeature.tabularFigures()]),
               ),
-
           const SizedBox(height: 10),
-
-          // Change + market closed badges
           if (tick != null)
             Wrap(
               spacing: 10, runSpacing: 8,
@@ -415,20 +576,14 @@ class StockPage extends StatelessWidget {
                   ),
               ],
             ),
-
           const SizedBox(height: 24),
-
-          // Sparkline
           Expanded(
-            child: history.length > 2
+            child: history.length >= 2
               ? _Sparkline(prices: history, colour: colour)
               : const Center(child: Text('Waiting for data...',
                   style: TextStyle(color: kGrey1, fontSize: 15))),
           ),
-
           const SizedBox(height: 18),
-
-          // Bid / Ask / Open
           if (tick?.bid != null || tick?.ask != null || tick?.open != null)
             Row(children: [
               _StatBox(label: 'BID',
@@ -440,7 +595,6 @@ class StockPage extends StatelessWidget {
               _StatBox(label: 'OPEN',
                 value: tick?.open != null ? _formatPrice(tick!.open!, service.subscribedSymbol) : '—'),
             ]),
-
           const SizedBox(height: 8),
           const Center(child: Text('← radar  ·  settings →',
             style: TextStyle(color: kGrey2, fontSize: 11))),
@@ -511,8 +665,11 @@ class _SparklinePainter extends CustomPainter {
     if (prices.length < 2) return;
     final minP  = prices.reduce(min);
     final maxP  = prices.reduce(max);
-    final range = maxP - minP;
-    if (range == 0) return;
+    var range = maxP - minP;
+    // Flat series: still draw a horizontal line (otherwise chart is blank).
+    if (range == 0) {
+      range = (minP.abs() * 1e-9) + 1e-12;
+    }
 
     double px(int i)    => i / (prices.length - 1) * size.width;
     double py(double p) =>
@@ -524,7 +681,6 @@ class _SparklinePainter extends CustomPainter {
       path.cubicTo(cpx, py(prices[i-1]), cpx, py(prices[i]), px(i), py(prices[i]));
     }
 
-    // Gradient fill using cached paint
     _fillPaint.shader = LinearGradient(
       begin: Alignment.topCenter, end: Alignment.bottomCenter,
       colors: [colour.withOpacity(0.28), colour.withOpacity(0.0)],
@@ -538,10 +694,7 @@ class _SparklinePainter extends CustomPainter {
       _fillPaint,
     );
 
-    // Line
     canvas.drawPath(path, _linePaint);
-
-    // End dot
     canvas.drawCircle(Offset(px(prices.length - 1), py(prices.last)), 5, _dotPaint);
   }
 
@@ -605,7 +758,6 @@ class Aircraft {
   );
 }
 
-// Top-level function for background JSON parsing
 List<Aircraft> _parseAircraft(String responseBody) {
   final data = jsonDecode(responseBody) as Map<String, dynamic>;
   return (data['ac'] as List<dynamic>? ?? [])
@@ -633,8 +785,6 @@ class _RadarPageState extends State<RadarPage> {
   void initState() {
     super.initState();
     _sweepNotifier = ValueNotifier(0.0);
-    
-    // Throttle radar sweep to roughly ~15 FPS to save CPU/GPU cycles on the Pi
     _sweepTimer = Timer.periodic(const Duration(milliseconds: 66), (_) {
       _sweepNotifier.value = (_sweepNotifier.value + 0.0165) % 1.0;
     });
@@ -654,11 +804,9 @@ class _RadarPageState extends State<RadarPage> {
   Future<void> _fetch() async {
     try {
       final url = Uri.parse(
-        'https://api.adsb.lol/v2/point'
-        '/$kRadarLat/$kRadarLon/${kRadarRadius.toInt()}');
+        'https://api.adsb.lol/v2/point/$kRadarLat/$kRadarLon/${kRadarRadius.toInt()}');
       final res = await http.get(url).timeout(const Duration(seconds: 6));
       if (res.statusCode == 200) {
-        // Offload large map allocations and JSON parsing to an isolate
         final ac = await compute(_parseAircraft, res.body);
         if (mounted) setState(() { _aircraft = ac; _loading = false; });
       }
@@ -674,8 +822,6 @@ class _RadarPageState extends State<RadarPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-
-          // Header
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
@@ -699,22 +845,10 @@ class _RadarPageState extends State<RadarPage> {
             '${kRadarLon.toStringAsFixed(2)}°E  ·  '
             '${kRadarRadius.toInt()} NM',
             style: TextStyle(color: kGreen.withOpacity(0.4), fontSize: 11)),
-
           const SizedBox(height: 14),
-
-          // Radar display - Isolated via RepaintBoundary
           Expanded(
             child: _loading
-              ? Center(child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const CircularProgressIndicator(color: kGreen),
-                    const SizedBox(height: 16),
-                    Text('SCANNING...',
-                      style: TextStyle(
-                        color: kGreen.withOpacity(0.5),
-                        fontSize: 12, letterSpacing: 3)),
-                  ]))
+              ? const Center(child: CircularProgressIndicator(color: kGreen))
               : RepaintBoundary(
                   child: ValueListenableBuilder<double>(
                     valueListenable: _sweepNotifier,
@@ -732,18 +866,10 @@ class _RadarPageState extends State<RadarPage> {
                   ),
                 ),
           ),
-
-          // Selected aircraft card
           AnimatedSwitcher(
             duration: const Duration(milliseconds: 200),
             child: _selected == null
-              ? Padding(
-                  key: const ValueKey('hint'),
-                  padding: const EdgeInsets.only(top: 10),
-                  child: Center(child: Text('tap an aircraft',
-                    style: TextStyle(
-                      color: kGreen.withOpacity(0.22),
-                      fontSize: 12, letterSpacing: 2))))
+              ? const Padding(padding: EdgeInsets.only(top: 10), child: Center(child: Text('tap an aircraft')))
               : _AircraftCard(
                   key: ValueKey(_selected!.icao),
                   aircraft: _selected!,
@@ -776,8 +902,7 @@ class _RadarPageState extends State<RadarPage> {
     setState(() => _selected = nearest);
   }
 
-  static Offset _project(
-      double lat, double lon, double cx, double cy, double r) {
+  static Offset _project(double lat, double lon, double cx, double cy, double r) {
     const deg2rad  = pi / 180.0;
     final dlat     = (lat - kRadarLat) * deg2rad;
     final dlon     = (lon - kRadarLon) * deg2rad * cos(kRadarLat * deg2rad);
@@ -789,50 +914,29 @@ class _RadarPageState extends State<RadarPage> {
   }
 }
 
-// ── RADAR PAINTER ─────────────────────────────────────────────────────────────
-
 class _RadarPainter extends CustomPainter {
   final List<Aircraft> aircraft;
   final double         sweep;
   final Aircraft?      selected;
 
-  // Cached completely static paints to avoid GC pressure
   static final Paint _bgPaint = Paint()..color = const Color(0xFF020E02);
   static final Paint _ringPaint = Paint()
-    ..color       = kGreen.withOpacity(0.13)
-    ..style       = PaintingStyle.stroke
+    ..color = kGreen.withOpacity(0.13)
+    ..style = PaintingStyle.stroke
     ..strokeWidth = 0.8;
   static final Paint _xPaint = Paint()
-    ..color       = kGreen.withOpacity(0.1)
+    ..color = kGreen.withOpacity(0.1)
     ..strokeWidth = 0.6;
   static final Paint _sweepLinePaint = Paint()
-    ..color       = kGreen.withOpacity(0.75)
+    ..color = kGreen.withOpacity(0.75)
     ..strokeWidth = 1.5;
-  static final Paint _homePaint = Paint()..color = kGreen;
-  static final Paint _homeRingPaint = Paint()
-    ..color       = kGreen.withOpacity(0.3)
-    ..style       = PaintingStyle.stroke
-    ..strokeWidth = 1.2;
-
-  // Cached dynamic paints
+  
   final Paint _sweepPaint = Paint()..style = PaintingStyle.fill;
   final Paint _glowPaint  = Paint();
   final Paint _blipPaint  = Paint();
   final Paint _trackPaint = Paint();
 
-  // Cached colors to avoid generating new Opacity objects per aircraft loop
-  static final Color _cSelGlow  = kGreen.withOpacity(0.22);
-  static final Color _cGlow     = kGreen.withOpacity(0.08);
-  static final Color _cSelBlip  = kGreen;
-  static final Color _cBlip     = kGreen.withOpacity(0.9);
-  static final Color _cSelTrack = kGreen.withOpacity(0.95);
-  static final Color _cTrack    = kGreen.withOpacity(0.5);
-
-  _RadarPainter({
-    required this.aircraft,
-    required this.sweep,
-    required this.selected,
-  });
+  _RadarPainter({required this.aircraft, required this.sweep, required this.selected});
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -841,27 +945,17 @@ class _RadarPainter extends CustomPainter {
     final radius = min(size.width, size.height * 0.88) / 2 - 8;
     final center = Offset(cx, cy);
 
-    // Clip everything to the circle
     canvas.save();
-    canvas.clipPath(Path()
-      ..addOval(Rect.fromCircle(center: center, radius: radius)));
-
-    // Background
+    canvas.clipPath(Path()..addOval(Rect.fromCircle(center: center, radius: radius)));
     canvas.drawCircle(center, radius, _bgPaint);
 
-    // Range rings
     for (final f in const [0.25, 0.5, 0.75, 1.0]) {
       canvas.drawCircle(center, radius * f, _ringPaint);
     }
 
-    // Crosshairs
     canvas.drawLine(Offset(cx - radius, cy), Offset(cx + radius, cy), _xPaint);
     canvas.drawLine(Offset(cx, cy - radius), Offset(cx, cy + radius), _xPaint);
-    final d = radius * 0.707;
-    canvas.drawLine(Offset(cx-d, cy-d), Offset(cx+d, cy+d), _xPaint);
-    canvas.drawLine(Offset(cx+d, cy-d), Offset(cx-d, cy+d), _xPaint);
 
-    // Sweep trail
     final sweepAngle = sweep * 2 * pi - pi / 2;
     _sweepPaint.shader = SweepGradient(
       startAngle: sweepAngle - 2.1,
@@ -871,66 +965,20 @@ class _RadarPainter extends CustomPainter {
     ).createShader(Rect.fromCircle(center: center, radius: radius));
     
     canvas.drawCircle(center, radius, _sweepPaint);
+    canvas.drawLine(center, Offset(cx + cos(sweepAngle) * radius, cy + sin(sweepAngle) * radius), _sweepLinePaint);
 
-    // Sweep line
-    canvas.drawLine(center,
-      Offset(cx + cos(sweepAngle) * radius, cy + sin(sweepAngle) * radius),
-      _sweepLinePaint);
-
-    // Aircraft blips
     for (final ac in aircraft) {
-      final pos  = _RadarPageState._project(ac.lat, ac.lon, cx, cy, radius);
+      final pos   = _RadarPageState._project(ac.lat, ac.lon, cx, cy, radius);
       final isSel = selected?.icao == ac.icao;
-      final bSize = isSel ? 5.5 : 3.5;
-
-      // Glow
-      _glowPaint.color = isSel ? _cSelGlow : _cGlow;
-      canvas.drawCircle(pos, bSize + 5, _glowPaint);
-
-      // Blip
-      _blipPaint.color = isSel ? _cSelBlip : _cBlip;
-      canvas.drawCircle(pos, bSize, _blipPaint);
-
-      // Track vector
-      if (ac.track != null) {
-        final tr  = (ac.track! - 90) * pi / 180;
-        final len = isSel ? 20.0 : 13.0;
-        _trackPaint
-          ..color       = isSel ? _cSelTrack : _cTrack
-          ..strokeWidth = isSel ? 1.5 : 1.0;
-        canvas.drawLine(pos,
-          Offset(pos.dx + cos(tr) * len, pos.dy + sin(tr) * len),
-          _trackPaint);
-      }
-
-      // Label for selected
-      if (isSel) {
-        final tp = TextPainter(
-          text: TextSpan(
-            text: ac.callsign.isEmpty ? ac.icao : ac.callsign,
-            style: const TextStyle(
-              color: kGreen, fontSize: 10,
-              fontWeight: FontWeight.w700, letterSpacing: 1.2)),
-          textDirection: TextDirection.ltr)..layout();
-        tp.paint(canvas, Offset(pos.dx + 9, pos.dy - 13));
-      }
+      _blipPaint.color = isSel ? kGreen : kGreen.withOpacity(0.9);
+      canvas.drawCircle(pos, isSel ? 5.5 : 3.5, _blipPaint);
     }
-
     canvas.restore();
-
-    // Home dot (drawn after clip restore so it's always on top)
-    canvas.drawCircle(center, 5, _homePaint);
-    canvas.drawCircle(center, 9, _homeRingPaint);
   }
 
   @override
-  bool shouldRepaint(_RadarPainter old) =>
-      old.sweep != sweep ||
-      old.aircraft.length != aircraft.length ||
-      old.selected?.icao != selected?.icao;
+  bool shouldRepaint(_RadarPainter old) => true;
 }
-
-// ── AIRCRAFT CARD ─────────────────────────────────────────────────────────────
 
 class _AircraftCard extends StatelessWidget {
   final Aircraft     aircraft;
@@ -939,155 +987,163 @@ class _AircraftCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final info = [
-      if (aircraft.altitude != null)
-        '${_fmtAlt(aircraft.altitude!)} ft',
-      if (aircraft.speed != null)
-        '${aircraft.speed!.toStringAsFixed(0)} kts',
-      if (aircraft.track != null)
-        '${aircraft.track!.toStringAsFixed(0)}°',
-    ].join('  ·  ');
-
     return GestureDetector(
       onTap: onDismiss,
       child: Container(
-        margin:  const EdgeInsets.only(top: 12),
+        margin: const EdgeInsets.only(top: 12),
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         decoration: BoxDecoration(
-          color:        kGreen.withOpacity(0.07),
+          color: kGreen.withOpacity(0.07),
           borderRadius: BorderRadius.circular(14),
-          border:       Border.all(color: kGreen.withOpacity(0.25))),
+          border: Border.all(color: kGreen.withOpacity(0.25))),
         child: Row(children: [
-          Container(
-            width: 38, height: 38,
-            decoration: BoxDecoration(
-              color: kGreen.withOpacity(0.15), shape: BoxShape.circle),
-            child: const Icon(Icons.flight, color: kGreen, size: 20)),
+          const Icon(Icons.flight, color: kGreen),
           const SizedBox(width: 14),
-          Expanded(child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                aircraft.callsign.isEmpty ? aircraft.icao : aircraft.callsign,
-                style: const TextStyle(
-                  color: kGreen, fontSize: 16,
-                  fontWeight: FontWeight.w700, letterSpacing: 1.5)),
-              if (info.isNotEmpty) ...[
-                const SizedBox(height: 3),
-                Text(info, style: TextStyle(
-                  color: kGreen.withOpacity(0.5),
-                  fontSize: 11, letterSpacing: 0.5)),
-              ],
-            ],
-          )),
-          Text(aircraft.icao,
-            style: TextStyle(
-              color: kGreen.withOpacity(0.28),
-              fontSize: 10, letterSpacing: 1.2,
-              fontFeatures: const [FontFeature.tabularFigures()])),
+          Expanded(child: Text(aircraft.callsign.isEmpty ? aircraft.icao : aircraft.callsign,
+            style: const TextStyle(color: kGreen, fontWeight: FontWeight.bold))),
+          Text(aircraft.icao, style: TextStyle(color: kGreen.withOpacity(0.5), fontSize: 10)),
         ]),
       ),
     );
   }
-
-  String _fmtAlt(int n) => n.toString()
-    .replaceAllMapped(RegExp(r'(\d{1,3})(?=(\d{3})+$)'), (m) => '${m[1]},');
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
 // PAGE 2 — SETTINGS
 // ═════════════════════════════════════════════════════════════════════════════
 
-class SettingsPage extends StatelessWidget {
+class SettingsPage extends StatefulWidget {
   final MarketService service;
-  const SettingsPage({super.key, required this.service});
+  final int           cursor;
+  const SettingsPage({super.key, required this.service, this.cursor = 0});
+
+  @override
+  State<SettingsPage> createState() => _SettingsPageState();
+}
+
+class _SettingsPageState extends State<SettingsPage> {
+  static const int _crossCount = 3;
+  static const double _crossSpace = 12;
+  static const double _mainSpace = 12;
+  static const double _aspect = 2.0;
+
+  final ScrollController _scroll = ScrollController();
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _scrollCursorIntoView());
+  }
+
+  @override
+  void didUpdateWidget(SettingsPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.cursor != widget.cursor) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _scrollCursorIntoView());
+    }
+  }
+
+  @override
+  void dispose() {
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  /// Matches [SliverGridDelegateWithFixedCrossAxisCount] below so scroll offset matches tiles.
+  void _scrollCursorIntoView() {
+    if (!mounted || !_scroll.hasClients) return;
+    final symbols = widget.service.availableSymbols;
+    if (symbols.isEmpty) return;
+
+    final w = MediaQuery.sizeOf(context).width;
+    if (w <= 0) return;
+
+    const pad = 24.0;
+    final gridW = (w - pad * 2).clamp(1.0, double.infinity);
+    final tileCross = (gridW - _crossSpace * (_crossCount - 1)) / _crossCount;
+    final tileMain = tileCross / _aspect;
+    final rowStride = tileMain + _mainSpace;
+
+    final row = widget.cursor ~/ _crossCount;
+    final rowTop = row * rowStride;
+    final rowBottom = rowTop + tileMain;
+
+    final pos = _scroll.position;
+    final vp = pos.viewportDimension;
+    var target = pos.pixels;
+    if (rowTop < pos.pixels) {
+      target = rowTop;
+    } else if (rowBottom > pos.pixels + vp) {
+      target = rowBottom - vp;
+    }
+    target = target.clamp(0.0, pos.maxScrollExtent);
+    if ((target - pos.pixels).abs() > 0.5) {
+      _scroll.animateTo(
+        target,
+        duration: const Duration(milliseconds: 220),
+        curve: Curves.easeOutCubic,
+      );
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
-    final symbols = service.availableSymbols;
+    final symbols = widget.service.availableSymbols;
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(24, 56, 24, 44),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-
-          const Text('Settings', style: TextStyle(
-            color: kWhite, fontSize: 32, fontWeight: FontWeight.bold)),
+          const Text('Settings', style: TextStyle(color: kWhite, fontSize: 32, fontWeight: FontWeight.bold)),
           const SizedBox(height: 4),
-          const Text('Choose symbol to track',
-            style: TextStyle(color: kGrey1, fontSize: 14)),
+          const Text('Choose symbol to track', style: TextStyle(color: kGrey1, fontSize: 14)),
           const SizedBox(height: 28),
-
-          // Symbol grid — auto-populated from VPS
           Expanded(
             child: symbols.isEmpty
-              ? const Center(child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    CircularProgressIndicator(color: kGreen),
-                    SizedBox(height: 18),
-                    Text('Waiting for VPS...',
-                      style: TextStyle(color: kGrey1, fontSize: 15)),
-                  ]))
+              ? const Center(child: CircularProgressIndicator(color: kGreen))
               : GridView.builder(
-                  gridDelegate:
-                    const SliverGridDelegateWithFixedCrossAxisCount(
-                      crossAxisCount: 3,
-                      crossAxisSpacing: 12, mainAxisSpacing: 12,
-                      childAspectRatio: 2.0),
+                  controller: _scroll,
+                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: _crossCount,
+                    crossAxisSpacing: _crossSpace,
+                    mainAxisSpacing: _mainSpace,
+                    childAspectRatio: _aspect,
+                  ),
                   itemCount: symbols.length,
                   itemBuilder: (ctx, i) {
                     final sym = symbols[i];
-                    final sel = sym == service.subscribedSymbol;
+                    final sel = sym == widget.service.subscribedSymbol;
+                    final keyboard = i == widget.cursor;
                     return GestureDetector(
                       onTap: () {
-                        service.subscribe(sym);
-                        // navigate back to stock page
-                        final shell = ctx.findAncestorStateOfType<
-                            _DashboardShellState>();
-                        shell?._pageController.animateToPage(1,
-                          duration: const Duration(milliseconds: 300),
-                          curve: Curves.easeInOut);
+                        widget.service.subscribe(sym);
+                        final shell = ctx.findAncestorStateOfType<_DashboardShellState>();
+                        shell?._pageController.animateToPage(1, duration: const Duration(milliseconds: 300), curve: Curves.easeInOut);
                       },
                       child: AnimatedContainer(
                         duration: const Duration(milliseconds: 200),
                         decoration: BoxDecoration(
-                          color: sel ? kGreen.withOpacity(0.2) : kCard,
+                          color: sel ? kGreen.withOpacity(0.2) : keyboard ? kWhite.withOpacity(0.07) : kCard,
                           borderRadius: BorderRadius.circular(12),
-                          border: Border.all(
-                            color: sel ? kGreen : Colors.transparent,
-                            width: 1.8)),
-                        child: Center(child: Text(sym,
-                          style: TextStyle(
-                            color: sel ? kGreen : kWhite,
-                            fontSize: 13, fontWeight: FontWeight.w600))),
+                          border: Border.all(color: sel ? kGreen : keyboard ? kWhite.withOpacity(0.4) : Colors.transparent, width: 1.8)),
+                        child: Center(child: Text(sym, style: TextStyle(color: sel ? kGreen : kWhite, fontSize: 13, fontWeight: FontWeight.w600))),
                       ),
                     );
                   },
                 ),
           ),
-
           const SizedBox(height: 16),
-
-          // VPS status bar
-Container(
-  padding: const EdgeInsets.all(16),
-  decoration: BoxDecoration(
-    color: kCard, borderRadius: BorderRadius.circular(14)),
-  child: Row(children: [
-    const Icon(Icons.shield, color: kGreen, size: 18), // Changed icon to shield for security
-    const SizedBox(width: 12),
-    Expanded(child: Text(
-      'SECURE TUNNEL: $VPS_HOST  ·  '
-      '${service.connected ? "Active" : "Offline"}',
-      style: const TextStyle(color: kGrey1, fontSize: 12))),
-    Container(width: 10, height: 10,
-      decoration: BoxDecoration(
-        color:  service.connected ? kGreen : kRed,
-        shape:  BoxShape.circle)),
-  ]),
-),
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(color: kCard, borderRadius: BorderRadius.circular(14)),
+            child: Row(children: [
+              const Icon(Icons.shield, color: kGreen, size: 18),
+              const SizedBox(width: 12),
+              Expanded(child: Text('SECURE TUNNEL: $VPS_HOST', style: const TextStyle(color: kGrey1, fontSize: 12))),
+              Container(width: 10, height: 10, decoration: BoxDecoration(color: widget.service.connected ? kGreen : kRed, shape: BoxShape.circle)),
+            ]),
+          ),
         ],
       ),
     );

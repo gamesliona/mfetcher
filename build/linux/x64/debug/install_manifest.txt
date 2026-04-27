@@ -11,3 +11,4 @@
 /home/rage/market_dashboard/build/linux/x64/debug/bundle/data/flutter_assets/FontManifest.json
 /home/rage/market_dashboard/build/linux/x64/debug/bundle/data/flutter_assets/version.json
 /home/rage/market_dashboard/build/linux/x64/debug/bundle/data/flutter_assets/NOTICES.Z
+/home/rage/market_dashboard/build/linux/x64/debug/bundle/data/flutter_assets/icudtl.dat
